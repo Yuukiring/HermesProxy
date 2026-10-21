@@ -2372,6 +2372,24 @@ public static partial class GameData
             jobs.Add(LoadV3_4_3ItemEffectLookup);
         }
         Parallel.Invoke(jobs.ToArray());
+
+        // 把上一次运行期间算出来的热修读回内存（见 HotfixRuntimeCache）。
+        // 必须排在所有 CSV 载入之后：CSV 里的记录按行号占着各自的 HotfixId，重建的排在它们后面。
+        HotfixRuntimeCache.Init(ModernVersion.ExpansionVersion);
+        HotfixRuntimeCache.RestoreIntoHotfixes((recordId, table, content, removed) =>
+        {
+            if (removed)
+                return;
+
+            HotfixRecord restored = new HotfixRecord();
+            restored.Status = HotfixStatus.Valid;
+            restored.TableHash = table;
+            restored.RecordId = recordId;
+            restored.HotfixId = GetFirstFreeId(Hotfixes, ref _hotfixesCursor, HotfixItemBegin);
+            restored.UniqueId = restored.HotfixId;
+            restored.HotfixContent = new ByteBuffer(content);
+            Hotfixes[restored.HotfixId] = restored;
+        });
     }
 
     public static void LoadAreaTriggerHotfixes()
@@ -4041,11 +4059,12 @@ public static partial class GameData
     {
         void DoStuff(uint recordId, DB2Hash table, Action<ByteBuffer>? writer)
         {
+            HotfixRecord record;
             List<HotfixRecord> oldRecords = FindHotfixesByRecordIdAndTable(recordId, table, HotfixItemBegin);
             if (oldRecords.Count == 0)
             {
                 // We have a new entry
-                HotfixRecord record = new HotfixRecord();
+                record = new HotfixRecord();
                 record.Status = remove ? HotfixStatus.RecordRemoved : HotfixStatus.Valid;
                 record.TableHash = table;
                 record.HotfixId = GetFirstFreeId(Hotfixes, ref _hotfixesCursor, HotfixItemBegin);
@@ -4057,19 +4076,23 @@ public static partial class GameData
             else
             {
                 IEnumerable<HotfixRecord> oldRecordsToBeInvalided = oldRecords.SkipLast(1);
-                foreach (var record in oldRecordsToBeInvalided) // TODO maybe just delete these?
+                foreach (var oldRecord in oldRecordsToBeInvalided) // TODO maybe just delete these?
                 {
-                    record.Status = HotfixStatus.Invalid;
-                    record.HotfixContent = new();
-                    Log.Print(LogType.Storage, $"Got duplicate record for record {record.RecordId} in {record.TableHash}");
+                    oldRecord.Status = HotfixStatus.Invalid;
+                    oldRecord.HotfixContent = new();
+                    Log.Print(LogType.Storage, $"Got duplicate record for record {oldRecord.RecordId} in {oldRecord.TableHash}");
                 }
 
-                HotfixRecord recordToOverwrite = oldRecords.Last();
-                recordToOverwrite.Status = remove ? HotfixStatus.RecordRemoved : HotfixStatus.Valid;
-                recordToOverwrite.HotfixContent = new();
-                writer?.Invoke(recordToOverwrite.HotfixContent);
-                Hotfixes[recordToOverwrite.HotfixId] = recordToOverwrite;
+                record = oldRecords.Last();
+                record.Status = remove ? HotfixStatus.RecordRemoved : HotfixStatus.Valid;
+                record.HotfixContent = new();
+                writer?.Invoke(record.HotfixContent);
+                Hotfixes[record.HotfixId] = record;
             }
+
+            // 落盘一份：Hotfixes 表是纯内存的，登录器在游戏退出时会连带关掉代理，
+            // 不写盘的话「下次登录再发」永远等不到下次。
+            HotfixRuntimeCache.Remember(table, recordId, remove, record.HotfixContent);
         }
 
         if (obj is ItemRecord item)
@@ -4228,6 +4251,21 @@ public static partial class GameData
         where T : IEquatable<T>
         => guard && Cmp(log, field, mine, theirs);
 
+    /// <summary>
+    /// Indexed compare for a legacy float that ItemSparse stores truncated. Anything under one
+    /// whole point counts as equal: the truncation itself must not keep tripping the hotfix.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool CmpNear(bool log, string field, int index, int mine, float theirs)
+    {
+        if (Math.Abs(mine - theirs) < 1.0f)
+            return false;
+
+        if (log)
+            Log.Print(LogType.Storage, $"{field}[{index}] {mine} vs {theirs}");
+        return true;
+    }
+
     /// <summary>Ordinal string compare; quotes both sides so a trailing-space diff is visible.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static bool CmpStr(bool log, string field, string mine, string theirs)
@@ -4319,6 +4357,22 @@ public static partial class GameData
                 d |= Cmp(log, "Resistances", 5, r.Resistances[5], (short)item.ShadowResistance);
                 d |= Cmp(log, "Resistances", 6, r.Resistances[6], (short)item.ArcaneResistance);
                 d |= Cmp(log, "ScalingStatDistributionId", r.ScalingStatDistributionId, (ushort)item.ScalingStatDistribution);
+                // Armor / MinDamage / MaxDamage are what the player reads on the tooltip, and the
+                // 1.14 client renders them straight out of ItemSparse — there is no packet that
+                // carries them. Leave them out of the diff and a piece whose only legacy-vs-baked
+                // difference is its armor or its weapon damage never trips a hotfix at all, so the
+                // client keeps showing the Blizzard DB2 numbers forever.
+                //
+                // Armor is integral on both sides, so an exact compare is fine. Weapon damage is a
+                // float in item_template and a ushort in ItemSparse: an exact compare would flag
+                // every weapon whose legacy damage has a fraction (12.5 vs the baked 12) on every
+                // single login forever, so those two use a sub-1 tolerance. A difference the player
+                // could actually see — 45 vs 12 on a custom server — is far above that.
+                d |= Cmp(log, "Resistances", 0, r.Resistances[0], (short)item.Armor);
+                for (int i = 0; i < 5; i++)
+                    d |= CmpNear(log, "MinDamage", i, r.MinDamage[i], item.DamageMins[i]);
+                for (int i = 0; i < 5; i++)
+                    d |= CmpNear(log, "MaxDamage", i, r.MaxDamage[i], item.DamageMaxs[i]);
                 for (int i = 0; i < 3; i++)
                     d |= Cmp(log, "SocketType", i, r.SocketType[i], ModernVersion.ConvertSocketColor((byte)item.ItemSocketColors[i]));
                 d |= Cmp(log, "SheatheType", r.SheatheType, (byte)item.SheathType);

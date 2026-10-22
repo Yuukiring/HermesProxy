@@ -74,7 +74,10 @@ public static class NpcSystem
         }
 
         WorldPacket packet = new WorldPacket(Opcode.CMSG_TALK_TO_GOSSIP);
-        packet.WriteGuid(interact.CreatureGUID.To64());
+        // A creature summoned as a pet carries a HIGHGUID_PET guid; without the session the
+        // reverse conversion invents a pet guid the server never saw, so it answers nothing.
+        // To64(gameState) recovers the original legacy pet guid.
+        packet.WriteGuid(interact.CreatureGUID.To64(ctx.GetSession().GameState));
         ctx.SendPacketToServer(packet);
     }
 
@@ -82,7 +85,8 @@ public static class NpcSystem
     public static void HandleGossipSelectOption(in GossipSelectOption gossip, in SessionContext ctx)
     {
         WorldPacket packet = new WorldPacket(Opcode.CMSG_GOSSIP_SELECT_OPTION);
-        packet.WriteGuid(gossip.GossipUnit.To64());
+        // Same session-aware conversion as HandleTalkToGossip (pet-summoned NPCs).
+        packet.WriteGuid(gossip.GossipUnit.To64(ctx.GetSession().GameState));
         if (LegacyVersion.AddedInVersion(ClientVersionBuild.V2_0_1_6180))
             packet.WriteUInt32(gossip.GossipID);
         packet.WriteUInt32(gossip.GossipIndex);

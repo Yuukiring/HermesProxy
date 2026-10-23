@@ -61,6 +61,13 @@ public partial class WorldClient
     // Built alongside _globalSession in ConnectToWorldServer; the ctor runs before a session exists.
     SessionContext _sessionContext;
     readonly Lock _sendLock = new();
+
+    /// <summary>
+    /// How long a send may occupy this session's send path (lock wait + socket write) before it
+    /// is logged. Purely a reporting threshold: a stalled send is otherwise invisible until the
+    /// client gives up, which is exactly how a session freeze used to read as a random drop.
+    /// </summary>
+    private const long SlowSendWarnMs = 2_000;
     Timer? _keepAliveTimer;
     uint _keepAlivePingSerial;
     const int KeepAliveIntervalMs = 30_000;
@@ -238,6 +245,15 @@ public partial class WorldClient
             _clientSocket.EndConnect(AR);
             _clientSocket.ReceiveBufferSize = 65535;
             _clientSocket.NoDelay = true;
+
+            // The modern client-facing sockets get this from SocketBase. This one is a raw
+            // socket: without a send deadline, a legacy server that stops draining (full
+            // receive window, stuck proxy on its side) parks the blocking Send below forever,
+            // and it does so while holding _sendLock — so every later packet of this session,
+            // pings included, waits behind it and the player sees a silent freeze that ends in
+            // a client-side disconnect. Matches SocketBase's deadline so both directions behave
+            // the same way under a stalled peer.
+            _clientSocket.SendTimeout = 15_000;
 
             _ = Task.Run(ReceiveLoop);
         }
@@ -419,6 +435,10 @@ public partial class WorldClient
     /// </remarks>
     private void SendPacket(WorldPacket packet)
     {
+        // Measured from before the lock on purpose: a send queued behind this session's own
+        // stalled write is the same symptom for the player as the stalled write itself.
+        long queuedAt = Environment.TickCount64;
+
         lock (_sendLock)
         {
             try
@@ -447,6 +467,26 @@ public partial class WorldClient
                 buffer.WriteBytes(packet.GetData(), packet.GetSize());
 
                 _clientSocket.Send(buffer.GetData(), SocketFlags.None);
+
+                long stalledMs = Environment.TickCount64 - queuedAt;
+                if (stalledMs >= SlowSendWarnMs)
+                {
+                    Log.PrintNet(LogType.Warn, LogNetDir.P2S,
+                        $"Send to the legacy server took {stalledMs} ms (opcode 0x{header.Opcode:X}, {header.Size} B); " +
+                        "the socket is not draining and this session is falling behind.");
+                }
+            }
+            catch (SocketException ex) when (ex.SocketErrorCode == SocketError.TimedOut)
+            {
+                // A timed-out send has already put an unknown number of bytes on the wire, so the
+                // frame boundary is gone and nothing further can be written to this peer. Close
+                // it and let the receive loop tear the session down the way any other drop does —
+                // limping on would keep every later packet blocked behind the same lock.
+                Log.PrintNet(LogType.Error, LogNetDir.P2S,
+                    "Send to the legacy server timed out; closing the connection");
+                if (_isSuccessful == null)
+                    _isSuccessful = false;
+                CloseClientSocket();
             }
             catch (Exception ex)
             {

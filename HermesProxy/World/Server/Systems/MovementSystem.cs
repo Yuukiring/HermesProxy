@@ -262,7 +262,10 @@ public static class MovementSystem
         else
             packet.WriteGuid(teleport.MoverGUID.To64());
         packet.WriteUInt32(teleport.MoveCounter);
-        packet.WriteUInt32(teleport.MoveTime);
+        // Same normalisation as every other client→server movement write: the teleport ack
+        // carries the client's clock, and an un-normalised jump here feeds the legacy
+        // anticheat's client-vs-server clock comparison.
+        packet.WriteUInt32(SeatGravity.NormaliseClientMoveTime(ctx.GetSession().GameState, teleport.MoveTime));
         ctx.SendPacketToServer(packet);
     }
 

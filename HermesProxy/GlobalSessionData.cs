@@ -137,6 +137,25 @@ public sealed class GameSessionData
     public bool IsWaitingForWorldPortAck;
     public bool IsFirstEnterWorld;
     public bool IsInWorld;
+
+    // ---- Client→server movement-clock normalisation ----
+    // The modern client stamps movement packets with its own clock, and this proxy used to
+    // forward that value unchanged. The legacy anticheat (Anticheat/Movement/Movement.cpp,
+    // CHEAT_TYPE_NUM_DESYNC) compares how much client time has elapsed since the first
+    // movement of a session against how much server time has elapsed, and tolerates only
+    // ~500 ms per minute of divergence. A client clock that runs faster than the server's —
+    // or one re-based by its own time-sync machinery, which this proxy does not drive for
+    // vanilla — crosses that line after an hour or two of play, the anticheat kicks the
+    // session, and the player sees a random disconnect.
+    //
+    // The fix is to re-base the outgoing movement clock on this session's first movement
+    // packet and advance it by real elapsed time (proxy clock). The legacy check only ever
+    // compares ctime values against each other, so the epoch is irrelevant and the rate is
+    // correct by construction. Anchored per GameState (i.e. per login), matching how the
+    // server resets its own baseline in Movement::HandleLeaveWorld.
+    public long? MovementClockAnchorProxyTick;
+    public long MovementClockAnchorClientTime;
+    public uint LastC2SMovementTime;
     // Purchased stable slots, learned from legacy MSG_LIST_STABLED_PETS. V3_4_3 keeps this
     // in ActivePlayerData, and the client greys out every slot it thinks is unpurchased,
     // so a hardcoded 0 here makes bought slots stay locked (issue #224).
@@ -2095,6 +2114,12 @@ public class GlobalSessionData
     public WorldSocket RealmSocket = null!;
     public WorldSocket InstanceSocket = null!;
     public AuthClient AuthClient = null!;
+
+    /// <summary>
+    /// Legacy Warden emulation for this session. Created lazily on the first SMSG_WARDEN_DATA,
+    /// because its keystream is keyed off the SRP premaster secret of the legacy login.
+    /// </summary>
+    internal HermesProxy.World.Server.Warden.WardenSession? Warden;
     public WorldClient? WorldClient;
     public SniffFile ModernSniff = null!;
     // Sniff of the cMangos↔HermesProxy legacy stream. Created lazily by WorldClient

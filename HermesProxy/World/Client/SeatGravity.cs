@@ -1,3 +1,4 @@
+using System;
 using HermesProxy.Enums;
 using HermesProxy.World.Enums;
 using HermesProxy.World.Objects;
@@ -75,18 +76,46 @@ internal static class SeatGravity
     }
 
     /// <summary>
+    /// Re-bases a client movement timestamp onto this session's normalised clock. See the field
+    /// docs on <see cref="GameSessionData"/> for why: the legacy anticheat's desync check only
+    /// cares about the <em>rate</em> of the clock, and this makes the rate real time by
+    /// construction. The client's own epoch is kept as the base.
+    /// </summary>
+    public static uint NormaliseClientMoveTime(GameSessionData gameState, uint clientMoveTime)
+    {
+        long proxyTick = Environment.TickCount64;
+        if (gameState.MovementClockAnchorProxyTick is long anchorTick)
+        {
+            long outTime = gameState.MovementClockAnchorClientTime + (proxyTick - anchorTick);
+            uint outTime32 = (uint)outTime;
+            if (outTime32 <= gameState.LastC2SMovementTime)
+                outTime32 = gameState.LastC2SMovementTime + 1; // the legacy server rejects time going backwards
+            gameState.LastC2SMovementTime = outTime32;
+            return outTime32;
+        }
+
+        gameState.MovementClockAnchorProxyTick = proxyTick;
+        gameState.MovementClockAnchorClientTime = clientMoveTime;
+        gameState.LastC2SMovementTime = clientMoveTime;
+        return clientMoveTime;
+    }
+
+    /// <summary>
     /// Writes the client's movement block for the legacy server, without the gravity flag while
     /// the proxy is the one that set it.
     /// </summary>
     public static void WriteClientMovement(WorldPacket packet, in MovementInfo moveInfo, GameSessionData gameState)
     {
+        MovementInfo normalised = moveInfo;
+        normalised.MoveTime = NormaliseClientMoveTime(gameState, moveInfo.MoveTime);
+
         if (gameState.SeatGravity == SeatGravityState.None)
         {
-            LegacyMovementCodec.Write(packet, in moveInfo);
+            LegacyMovementCodec.Write(packet, in normalised);
             return;
         }
 
-        MovementInfo shown = moveInfo;
+        MovementInfo shown = normalised;
         shown.Flags &= ~MovementFlagModern.DisableGravity;
         LegacyMovementCodec.Write(packet, in shown);
     }
